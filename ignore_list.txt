@@ -1,1 +1,6 @@
 ./__pycache__/
+./venv/
+./test_output/
+./downloaded_html/
+ignore_list.txt
+test_scraper.py

@@ -1,4 +1,4 @@
-from scraper import scrape_page, convert_html_to_markdown
+from scraper import scrape_page
 import logger
 from urllib.parse import urlparse
 import os
@@ -14,11 +14,3 @@ start_path = os.path.dirname(parsed_url.path)
 
 # Start the scraping process
 scrape_page(base_url, base_domain, start_path, delay=3)  # Increased delay to 3 seconds
-
-# Convert all HTML files to Markdown
-downloaded_html_dir = os.path.join('downloaded_html', base_domain)
-for root, dirs, files in os.walk(downloaded_html_dir):
-    for file in files:
-        if file.endswith('.html'):
-            filepath = os.path.join(root, file)
-            convert_html_to_markdown(filepath)
