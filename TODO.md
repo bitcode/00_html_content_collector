@@ -6,20 +6,28 @@
 - [x] Add sitemap.xml parsing
 - [x] Enhance rate limiting with dynamic adjustment
 - [x] Implement content hashing for efficient updates
-- [ ] Add metadata extraction (title, description, keywords, last modified date)
+- [x] Add metadata extraction (title, description, keywords, last modified date)
 - [ ] Improve error handling with automatic retries and exponential backoff
-- [ ] Add MIME type checking for responses
-- [ ] Implement JavaScript rendering for dynamic content
+- [x] Add MIME type checking for responses
+- [x] Implement JavaScript rendering for dynamic content
+- [ ] Handle infinite scrolling and click-to-expand content
 - [ ] Add support for concurrent requests
 - [ ] Develop incremental scraping system
+  - [ ] Implement change detection mechanism (timestamps, checksums)
+  - [ ] Develop partial update system for modified content
+  - [ ] Design efficient storage system for easy updates and comparisons
+  - [ ] Implement smart crawling to prioritize frequently updated pages
+  - [ ] Develop delta processing to handle only changed content
+  - [ ] Implement resumable operations for interrupted scrapes
+  - [ ] Set up scheduled runs for automatic updates
 - [ ] Implement custom headers (user-agent, etc.)
 - [ ] Add cookie handling for session management
 - [ ] Implement proxy rotation for large-scale scraping
 - [ ] Improve URL normalization
-- [ ] Add content cleaning and normalization functions
+- [x] Add content cleaning and normalization functions
 - [ ] Implement asset downloading (CSS, JS, images)
 - [ ] Add link integrity checking
-- [ ] Implement structured data extraction
+- [x] Implement structured data extraction
 - [ ] Add pagination handling
 - [ ] Explore and implement API integration if available
 
