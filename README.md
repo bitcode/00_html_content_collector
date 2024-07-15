@@ -14,6 +14,9 @@ This project is a web scraper designed to download HTML content from a documenta
 - Logs scraping activity and errors to a file named `app.log`
 - Handles network-related errors and unhandled status codes
 - Avoids re-downloading already scraped pages
+- Implements JavaScript rendering for dynamic content
+- Performs content cleaning and normalization
+- Extracts and stores metadata and structured data
 
 ## Usage
 
@@ -39,6 +42,9 @@ The project relies on several Python packages, including:
 - requests
 - beautifulsoup4
 - cairosvg
+- selenium
+- langdetect
+- extruct
 
 For a complete list of dependencies, refer to the `requirements.txt` file.
 
@@ -52,6 +58,70 @@ You can customize the scraper behavior by modifying the following parameters in 
 ## Logging
 
 The scraper logs its activity to both a file (`app.log`) and the console. You can adjust the logging level in `logger.py` if needed.
+
+## Roadmap
+
+Our project roadmap outlines the upcoming features and improvements:
+
+### HTML Content Collector Improvements
+
+- [ ] Implement robots.txt compliance
+- [x] Add sitemap.xml parsing
+- [x] Enhance rate limiting with dynamic adjustment
+- [x] Implement content hashing for efficient updates
+- [x] Add metadata extraction (title, description, keywords, last modified date)
+- [ ] Improve error handling with automatic retries and exponential backoff
+- [x] Add MIME type checking for responses
+- [x] Implement JavaScript rendering for dynamic content
+- [ ] Handle infinite scrolling and click-to-expand content
+- [ ] Add support for concurrent requests
+- [ ] Develop incremental scraping system
+  - [ ] Implement change detection mechanism (timestamps, checksums)
+  - [ ] Develop partial update system for modified content
+  - [ ] Design efficient storage system for easy updates and comparisons
+  - [ ] Implement smart crawling to prioritize frequently updated pages
+  - [ ] Develop delta processing to handle only changed content
+  - [ ] Implement resumable operations for interrupted scrapes
+  - [ ] Set up scheduled runs for automatic updates
+- [ ] Implement custom headers (user-agent, etc.)
+- [ ] Add cookie handling for session management
+- [ ] Implement proxy rotation for large-scale scraping
+- [ ] Improve URL normalization
+  - [ ] Implement consistent URL format (scheme, domain, path)
+  - [ ] Apply case normalization for scheme and domain
+  - [ ] Handle default port removal
+  - [ ] Implement path normalization
+  - [ ] Implement query parameter handling
+  - [ ] Remove URL fragments
+  - [ ] Establish consistent WWW handling
+  - [ ] Implement trailing slash consistency
+  - [ ] Resolve protocol-relative URLs
+  - [ ] Handle Internationalized Domain Names (IDN)
+  - [ ] Implement URL shortener expansion
+  - [ ] Remove session IDs from URLs
+  - [ ] Recognize and use canonical URLs when specified
+- [x] Add content cleaning and normalization functions
+- [ ] Implement asset downloading (CSS, JS, images)
+- [ ] Add link integrity checking
+- [x] Implement structured data extraction
+- [ ] Add pagination handling
+- [ ] Explore and implement API integration if available
+
+### Additional planned improvements
+
+- Data quality and relevance enhancements
+- Time-sensitive data handling
+- Data structuring specific to trading information
+- Image and chart data extraction
+- API integrations for financial data
+- Data validation and integrity checks
+- Compliance and ethics considerations
+- Performance optimizations
+- Data preprocessing for financial information
+- Metadata enhancements
+- Export functionality for machine learning models
+
+For a more detailed view of our roadmap, please see our [TODO.md](TODO.md) file.
 
 ## License
 
