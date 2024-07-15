@@ -24,6 +24,24 @@
 - [ ] Add cookie handling for session management
 - [ ] Implement proxy rotation for large-scale scraping
 - [ ] Improve URL normalization
+  - [ ] Implement consistent URL format (scheme, domain, path)
+  - [ ] Apply case normalization for scheme and domain
+  - [ ] Handle default port removal
+  - [ ] Implement path normalization
+    - [ ] Resolve relative paths
+    - [ ] Remove unnecessary slashes
+    - [ ] Decode unnecessary percent-encoded characters
+  - [ ] Implement query parameter handling
+    - [ ] Sort parameters alphabetically
+    - [ ] Remove empty or unnecessary parameters
+  - [ ] Remove URL fragments
+  - [ ] Establish consistent WWW handling
+  - [ ] Implement trailing slash consistency
+  - [ ] Resolve protocol-relative URLs
+  - [ ] Handle Internationalized Domain Names (IDN)
+  - [ ] Implement URL shortener expansion
+  - [ ] Remove session IDs from URLs
+  - [ ] Recognize and use canonical URLs when specified
 - [x] Add content cleaning and normalization functions
 - [ ] Implement asset downloading (CSS, JS, images)
 - [ ] Add link integrity checking
