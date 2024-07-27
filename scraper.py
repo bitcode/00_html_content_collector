@@ -8,12 +8,12 @@ import hashlib
 import functools
 import mimetypes
 import random
-from functools import wraps
+from functools import wraps, lru_cache
 from requests import Session
 from requests.exceptions import RequestException
 from proxy_config import get_proxy_url
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from statistics import mean
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qs, urlencode, urldefrag, unquote, quote, parse_qsl
 
@@ -909,11 +909,48 @@ def expand_content(driver):
 def calculate_checksum(content):
     return hashlib.md5(content.encode()).hexdigest()
 
-def has_page_changed(url, current_content):
-    # Load previous checksum from storage
-    previous_checksum = load_checksum(url)
-    current_checksum = calculate_checksum(current_content)
-    return previous_checksum != current_checksum
+def has_headers_changed(url, existing_headers):
+    try:
+        response = requests.head(url)
+        new_headers = {
+            'Last-Modified': response.headers.get('Last-Modified'),
+            'ETag': response.headers.get('ETag'),
+            'Content-Length': response.headers.get('Content-Length')
+        }
+        if existing_headers is None:
+            return True
+        return any(new_headers.get(key) != existing_headers.get(key) for key in new_headers)
+    except requests.RequestException:
+        return True  # If we can't check, assume it has changed
+
+def get_stored_headers(url):
+    conn = create_connection()
+    if conn is not None:
+        try:
+            c = conn.cursor()
+            c.execute("SELECT headers FROM page_headers WHERE url = ?", (url,))
+            result = c.fetchone()
+            if result:
+                return json.loads(result[0])
+            return None
+        except Error as e:
+            logging.error(f"Error retrieving stored headers: {e}")
+        finally:
+            conn.close()
+    return None
+
+def update_stored_headers(url, headers):
+    conn = create_connection()
+    if conn is not None:
+        try:
+            c = conn.cursor()
+            headers_json = json.dumps(headers)
+            c.execute("INSERT OR REPLACE INTO page_headers (url, headers) VALUES (?, ?)", (url, headers_json))
+            conn.commit()
+        except Error as e:
+            logging.error(f"Error updating stored headers: {e}")
+        finally:
+            conn.close()
 
 def scrape_page(base_url, doc_name, version, initial_delay=1):
     parsed_url = urlparse(base_url)
@@ -1029,6 +1066,14 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
 
             start_time = time.time()
 
+            # Load the existing checksum and headers
+            existing_checksum = cached_load_checksum(normalized_url)
+            existing_headers = get_stored_headers(normalized_url)
+
+            if not has_headers_changed(url, existing_headers):
+                logging.info(f'Headers unchanged, skipping: {url}')
+                return
+
             content_type = requests.head(url).headers.get('Content-Type', '').split(';')[0]
 
             if content_type.startswith(('image/', 'audio/', 'video/', 'application/pdf')):
@@ -1038,6 +1083,7 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
                 @circuit_breaker
                 def fetch_with_circuit_breaker():
                     return fetch_page(driver, url)
+
                 try:
                     content = fetch_with_circuit_breaker()
                 except Exception as e:
@@ -1049,46 +1095,58 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
                         logging.error(f"Unexpected error while fetching {url}: {str(e)}")
                     return
 
-                soup = BeautifulSoup(content, 'html.parser')
-                canonical_url = get_canonical_url(soup, url)
+                new_checksum = calculate_checksum(content)
 
-                if canonical_url != url:
-                    logging.info(f"Canonical URL found for {url}: {canonical_url}")
-                    if canonical_url in visited:
-                        logging.info(f"Canonical URL {canonical_url} already visited, skipping.")
-                        return
-                    url = canonical_url  # Use the canonical URL from this point on
+                if existing_checksum != new_checksum:
+                    soup = BeautifulSoup(content, 'html.parser')
+                    canonical_url = get_canonical_url(soup, url)
 
-                with hash_manager.lock:
-                    old_hash_info = hash_manager.get_hash_info(doc_name, version, url)
-                    if hash_manager.content_changed(doc_name, version, url, content):
-                        visited.add(url)
-                        logging.info(f'Content changed, updating: {url}')
+                    if canonical_url != url:
+                        logging.info(f"Canonical URL found for {url}: {canonical_url}")
+                        if canonical_url in visited:
+                            logging.info(f"Canonical URL {canonical_url} already visited, skipping.")
+                            return
+                        url = canonical_url  # Use the canonical URL from this point on
 
-                        if old_hash_info:
-                            # Perform partial update
-                            diff = compute_content_diff(old_hash_info['content'], content)
-                            update_partial_content(doc_name, version, url, diff)
+                    with hash_manager.lock:
+                        old_hash_info = hash_manager.get_hash_info(doc_name, version, url)
+                        if hash_manager.content_changed(doc_name, version, url, content):
+                            visited.add(url)
+                            logging.info(f'Content changed, updating: {url}')
+
+                            if old_hash_info:
+                                # Perform partial update
+                                diff = compute_content_diff(old_hash_info['content'], content)
+                                update_partial_content(doc_name, version, url, diff)
+                            else:
+                                # Full save for new content
+                                save_content(content, url, doc_name, version, content_type)
+
+                            # Save to database
+                            new_headers = {
+                                'Last-Modified': driver.execute_script("return document.lastModified;"),
+                                'ETag': driver.execute_script("return document.querySelector('meta[name=\"etag\"]')?.content;"),
+                                'Content-Length': len(content)
+                            }
+                            save_page(url, content, new_checksum, new_headers)
+
+                            # Extract links from rendered page
+                            links, pagination_links = extract_links_selenium(driver, base_domain, start_path)
+                            for link in links.union(pagination_links):
+                                if link not in visited:
+                                    priority = calculate_priority(link, hash_manager, doc_name, version)
+                                    queue.put((priority, link))
+                                # Perform link integrity check
+                                integrity_result = check_link_integrity(link, url)
+                                link_integrity_results.append(integrity_result)
+                                save_link_integrity(integrity_result)
                         else:
-                            # Full save for new content
-                            save_content(content, url, doc_name, version, content_type)
+                            logging.info(f'Content unchanged, skipping: {url}')
 
-                        # Save to database
-                        checksum = calculate_checksum(content)
-                        save_page(url, content, checksum)
-
-                        # Extract links from rendered page
-                        links, pagination_links = extract_links_selenium(driver, base_domain, start_path)
-                        for link in links.union(pagination_links):
-                            if link not in visited:
-                                priority = calculate_priority(link, hash_manager, doc_name, version)
-                                queue.put((priority, link))
-                            # Perform link integrity check
-                            integrity_result = check_link_integrity(link, url)
-                            link_integrity_results.append(integrity_result)
-                            save_link_integrity(integrity_result)
-                    else:
-                        logging.info(f'Content unchanged, skipping: {url}')
+                    # Update stored headers
+                    update_stored_headers(url, new_headers)
+                else:
+                    logging.info(f'Content unchanged, skipping: {url}')
 
                 # Save scrape progress
                 save_scrape_progress(url)
@@ -1388,8 +1446,10 @@ def init_db():
             c.execute('''CREATE TABLE IF NOT EXISTS scrape_progress
                          (url TEXT PRIMARY KEY, last_scraped TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS link_integrity
-                         (url TEXT PRIMARY KEY, status_code INTEGER, is_redirect BOOLEAN, final_url TEXT, 
+                         (url TEXT PRIMARY KEY, status_code INTEGER, is_redirect BOOLEAN, final_url TEXT,
                           content_type TEXT, is_internal BOOLEAN, anchor_exists BOOLEAN)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS page_headers
+                         (url TEXT PRIMARY KEY, headers TEXT, last_updated TIMESTAMP)''')
             conn.commit()
         except Error as e:
             print(f"Error creating database tables: {e}")
@@ -1398,15 +1458,17 @@ def init_db():
     else:
         print("Error! Cannot create the database connection.")
 
-def save_page(url, content, checksum):
+def save_page(url, content, checksum, headers):
     conn = create_connection()
     if conn is not None:
         try:
             c = conn.cursor()
             c.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, datetime('now'))", (url, content, checksum))
+            headers_json = json.dumps(headers)
+            c.execute("INSERT OR REPLACE INTO page_headers VALUES (?, ?, datetime('now'))", (url, headers_json))
             conn.commit()
         except Error as e:
-            print(f"Error saving page: {e}")
+            print(f"Error saving page and headers: {e}")
         finally:
             conn.close()
     else:
@@ -1552,3 +1614,15 @@ def test_start_scraping_from():
 
 if __name__ == "__main__":
     test_start_scraping_from()
+
+checksum_cache = {}
+
+@lru_cache(maxsize=1000)
+def cached_load_checksum(url):
+    if url in checksum_cache:
+        checksum, timestamp = checksum_cache[url]
+        if datetime.now() - timestamp < timedelta(hours=1):  # Cache for 1 hour
+            return checksum
+    checksum = load_checksum(url)
+    checksum_cache[url] = (checksum, datetime.now())
+    return checksum
