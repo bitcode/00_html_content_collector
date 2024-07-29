@@ -616,13 +616,49 @@ class PriorityURL:
     def __lt__(self, other):
         return self.priority < other.priority
 
-def calculate_priority(url, hash_manager, doc_name, version):
+def calculate_priority(url, hash_manager, doc_name, version, is_pagination=False):
+    base_priority = 1.0
+
+    # Factor 1: Update frequency
+    update_frequency = get_page_update_frequency(url)
+    frequency_score = min(update_frequency / 10, 1)  # Normalize to 0-1 range
+
+    # Factor 2: Content freshness
     hash_info = hash_manager.get_hash_info(doc_name, version, url)
-    if not hash_info:
-        return 1  # Highest priority for new pages
-    last_modified = datetime.fromisoformat(hash_info['last_modified'])
-    time_since_last_update = datetime.now() - last_modified
-    return 1 / (time_since_last_update.total_seconds() + 1)
+    if hash_info:
+        last_modified = datetime.fromisoformat(hash_info['last_modified'])
+        time_since_update = (datetime.now() - last_modified).total_seconds()
+        freshness_score = 1 / (1 + time_since_update / 86400)  # Normalize to 0-1 range (86400 seconds in a day)
+    else:
+        freshness_score = 1  # New content gets highest freshness score
+
+    # Factor 3: URL depth (assuming shallower URLs are more important)
+    url_depth = len(urlparse(url).path.split('/')) - 1
+    depth_score = 1 / (1 + url_depth)
+
+    # Factor 4: Keyword relevance (example implementation)
+    relevance_score = calculate_keyword_relevance(url)
+
+    # Combine factors (you can adjust weights as needed)
+    priority = (
+        base_priority +
+        frequency_score * 0.3 +
+        freshness_score * 0.3 +
+        depth_score * 0.2 +
+        relevance_score * 0.2
+    )
+
+    if is_pagination:
+        priority *= 1.5  # Boost for pagination links
+
+    return priority
+
+def calculate_keyword_relevance(url):
+    # Implement keyword relevance calculation
+    # This is a placeholder implementation
+    keywords = ['important', 'critical', 'update', 'new']
+    relevance = sum(keyword in url.lower() for keyword in keywords)
+    return min(relevance / len(keywords), 1)  # Normalize to 0-1 range
 
 def preserve_mathjax(content):
     # Preserve inline math
@@ -698,12 +734,22 @@ def compute_content_diff(old_content, new_content):
 def update_partial_content(doc_name, version, url, diff):
     filepath = get_content_filepath(doc_name, version, url)
     with open(filepath, 'r', encoding='utf-8') as f:
-        old_content = f.read()
+        old_content = f.read().splitlines()
 
-    new_content = apply_diff(old_content, diff)
+    new_content = []
+    for operation in diff['operations']:
+        if operation['operation'] == 'equal':
+            new_content.append(operation['content'])
+        elif operation['operation'] == 'replace':
+            new_content.append(operation['new_content'])
+        elif operation['operation'] == 'insert':
+            new_content.append(operation['content'])
+        # 'delete' operations are implicitly handled by not adding anything
 
     with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(new_content)
+        f.write('\n'.join(new_content))
+
+    logging.info(f"Partial update applied to {url}")
 
 def apply_diff(old_content, diff):
     lines = old_content.splitlines()
@@ -893,6 +939,31 @@ def expand_content(driver):
         ".show-more", ".read-more", ".expand", "[id*='expand']", "[class*='expand']",
         "[aria-expanded='false']", ".collapsed", ".toggle", ".accordion-header"
     ]
+
+    load_more_selectors = [
+        ".load-more", ".show-more", "#loadMoreButton",
+        "[data-action='load-more']", "[aria-label='Load more']"
+    ]
+
+    for selector in load_more_selectors:
+        while True:
+            try:
+                load_more_button = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                )
+                driver.execute_script("arguments[0].click();", load_more_button)
+                time.sleep(2)  # Wait for content to load
+            except TimeoutException:
+                # No more "Load More" buttons found
+                break
+            except ElementClickInterceptedException:
+                # Button might be obscured, try to scroll to it
+                driver.execute_script("arguments[0].scrollIntoView();", load_more_button)
+                time.sleep(1)
+                continue
+            except Exception as e:
+                logging.error(f"Error expanding 'Load More' content: {str(e)}")
+                break
 
     for selector in expandable_selectors:
         elements = driver.find_elements(By.CSS_SELECTOR, selector)
@@ -1115,9 +1186,14 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
                             logging.info(f'Content changed, updating: {url}')
 
                             if old_hash_info:
-                                # Perform partial update
-                                diff = compute_content_diff(old_hash_info['content'], content)
-                                update_partial_content(doc_name, version, url, diff)
+                                # Generate diff using the new function
+                                diff = generate_optimized_diff(old_hash_info['content'], content, doc_name, version)
+                                try:
+                                    update_partial_content(doc_name, version, url, diff)
+                                except Exception as e:
+                                    logging.error(f"Partial update failed for {url}: {str(e)}")
+                                    # Fallback to full content update
+                                    save_content(content, url, doc_name, version, content_type)
                             else:
                                 # Full save for new content
                                 save_content(content, url, doc_name, version, content_type)
@@ -1132,11 +1208,19 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
 
                             # Extract links from rendered page
                             links, pagination_links = extract_links_selenium(driver, base_domain, start_path)
-                            for link in links.union(pagination_links):
+
+                            # Recalculate priorities for all links
+                            all_links = links.union(pagination_links)
+                            prioritized_links = prioritize_pages(all_links, hash_manager, doc_name, version)
+
+                            for priority, link in prioritized_links:
                                 if link not in visited:
-                                    priority = calculate_priority(link, hash_manager, doc_name, version)
+                                    if link in pagination_links:
+                                        priority *= 1.5  # Increase priority for pagination links
                                     queue.put((priority, link))
-                                # Perform link integrity check
+
+                            # Perform link integrity check for all links
+                            for link in all_links:
                                 integrity_result = check_link_integrity(link, url)
                                 link_integrity_results.append(integrity_result)
                                 save_link_integrity(integrity_result)
@@ -1401,12 +1485,22 @@ def update_asset_references(soup, assets, doc_name, version):
 
 def extract_pagination_links(soup, base_url):
     pagination_links = set()
-    # Look for common pagination patterns
-    pagination_elements = soup.find_all('a', href=True, text=re.compile(r'Next|Próximo|\d+'))
-    for element in pagination_elements:
-        href = element['href']
+
+    # Numbered pagination
+    numbered_links = soup.find_all('a', href=True, text=re.compile(r'^\d+$'))
+
+    # Next/Previous buttons
+    next_prev_links = soup.find_all('a', href=True, text=re.compile(r'Next|Previous|Próximo|Anterior', re.IGNORECASE))
+
+    # "Load More" buttons
+    load_more_links = soup.find_all('a', href=True, text=re.compile(r'Load More|Show More|Ver Mais', re.IGNORECASE))
+
+    # Combine all pagination links
+    for link in numbered_links + next_prev_links + load_more_links:
+        href = link['href']
         full_url = urljoin(base_url, href)
         pagination_links.add(full_url)
+
     return pagination_links
 
 def get_custom_headers():
@@ -1479,9 +1573,18 @@ def get_page_update_frequency(url):
     if conn is not None:
         try:
             c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM pages WHERE url = ? AND last_updated > datetime('now', '-7 days')", (url,))
-            update_count = c.fetchone()[0]
-            return update_count
+            c.execute("""
+                SELECT COUNT(*) as update_count,
+                       MIN(julianday('now') - julianday(last_updated)) as days_since_last_update
+                FROM pages
+                WHERE url = ? AND last_updated > datetime('now', '-30 days')
+            """, (url,))
+            result = c.fetchone()
+            if result:
+                update_count, days_since_last_update = result
+                if days_since_last_update is not None:
+                    return update_count / (days_since_last_update + 1)  # Adding 1 to avoid division by zero
+            return 0
         except Error as e:
             print(f"Error getting page update frequency: {e}")
         finally:
@@ -1490,8 +1593,14 @@ def get_page_update_frequency(url):
         print("Error! Cannot create the database connection.")
     return 0
 
-def prioritize_pages(urls):
-    return sorted(urls, key=get_page_update_frequency, reverse=True)
+def prioritize_pages(urls, hash_manager, doc_name, version):
+    prioritized_urls = []
+    for url in urls:
+        priority = calculate_priority(url, hash_manager, doc_name, version)
+        prioritized_urls.append((priority, url))
+
+    # Sort by priority (highest first)
+    return sorted(prioritized_urls, key=lambda x: x[0], reverse=True)
 
 def save_scrape_progress(url):
     conn = create_connection()
@@ -1588,8 +1697,17 @@ def start_scraping_from(url, doc_name, version, initial_delay=1, max_workers=5):
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'html.parser')
             canonical_url = get_canonical_url(soup, normalized_url)
-            priority = calculate_priority(canonical_url, hash_manager, doc_name, version)
-            queue.put((priority, canonical_url))
+
+            # Extract initial links
+            initial_links, _ = extract_links_selenium(setup_webdriver(), base_domain, start_path)
+
+            # Prioritize initial links
+            prioritized_links = prioritize_pages(initial_links, hash_manager, doc_name, version)
+
+            # Add prioritized links to the queue
+            for priority, link in prioritized_links:
+                queue.put((priority, link))
+
         except requests.RequestException as e:
             logging.error(f"Error fetching start URL: {e}")
             return
@@ -1626,3 +1744,147 @@ def cached_load_checksum(url):
     checksum = load_checksum(url)
     checksum_cache[url] = (checksum, datetime.now())
     return checksum
+
+def myers_diff(old_content, new_content):
+    def shortest_edit_sequence(a, b):
+        n, m = len(a), len(b)
+        max_d = n + m
+        v = {1: 0}
+        trace = []
+
+        for d in range(max_d + 1):
+            for k in range(-d, d + 1, 2):
+                if k == -d or (k != d and v.get(k - 1, float('-inf')) < v.get(k + 1, float('-inf'))):
+                    x = v[k + 1]
+                else:
+                    x = v[k - 1] + 1
+                y = x - k
+                while x < n and y < m and a[x] == b[y]:
+                    x, y = x + 1, y + 1
+                v[k] = x
+                if x >= n and y >= m:
+                    return trace
+            trace.append(v.copy())
+        return trace
+
+    def backtrack(trace, a, b):
+        x, y = len(a), len(b)
+        path = []
+        for d, v in reversed(list(enumerate(trace))):
+            k = x - y
+            if k == -d or (k != d and v.get(k - 1, float('-inf')) < v.get(k + 1, float('-inf'))):
+                k = k + 1
+            prev_x, prev_y = v[k], v[k] - k
+            while x > prev_x and y > prev_y:
+                path.append(('equal', x - 1, y - 1))
+                x, y = x - 1, y - 1
+            if d > 0:
+                path.append(('replace' if x > prev_x else 'insert', prev_x, prev_y))
+            x, y = prev_x, prev_y
+        return list(reversed(path))
+
+    a, b = old_content.splitlines(), new_content.splitlines()
+    trace = shortest_edit_sequence(a, b)
+    return backtrack(trace, a, b)
+
+def generate_diff(old_content, new_content, doc_name, version):
+    diff = myers_diff(old_content, new_content)
+
+    # Create a custom diff format with metadata
+    formatted_diff = {
+        'metadata': {
+            'doc_name': doc_name,
+            'version': version,
+            'timestamp': datetime.now().isoformat(),
+            'old_content_hash': hashlib.md5(old_content.encode()).hexdigest(),
+            'new_content_hash': hashlib.md5(new_content.encode()).hexdigest(),
+        },
+        'operations': []
+    }
+
+    for op, old_pos, new_pos in diff:
+        if op == 'equal':
+            formatted_diff['operations'].append({
+                'operation': 'equal',
+                'content': old_content.splitlines()[old_pos]
+            })
+        elif op == 'replace':
+            formatted_diff['operations'].append({
+                'operation': 'replace',
+                'old_content': old_content.splitlines()[old_pos],
+                'new_content': new_content.splitlines()[new_pos]
+            })
+        elif op == 'insert':
+            formatted_diff['operations'].append({
+                'operation': 'insert',
+                'content': new_content.splitlines()[new_pos]
+            })
+        elif op == 'delete':
+            formatted_diff['operations'].append({
+                'operation': 'delete',
+                'content': old_content.splitlines()[old_pos]
+            })
+
+    return formatted_diff
+
+def chunk_content(content, chunk_size=1000):
+    """Split content into chunks of specified size."""
+    return [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
+
+def generate_optimized_diff(old_content, new_content, doc_name, version, chunk_size=1000):
+    old_chunks = chunk_content(old_content, chunk_size)
+    new_chunks = chunk_content(new_content, chunk_size)
+
+    formatted_diff = {
+        'metadata': {
+            'doc_name': doc_name,
+            'version': version,
+            'timestamp': datetime.now().isoformat(),
+            'old_content_hash': hashlib.md5(old_content.encode()).hexdigest(),
+            'new_content_hash': hashlib.md5(new_content.encode()).hexdigest(),
+        },
+        'chunks': []
+    }
+
+    for i, (old_chunk, new_chunk) in enumerate(zip(old_chunks, new_chunks)):
+        if old_chunk != new_chunk:
+            chunk_diff = myers_diff(old_chunk, new_chunk)
+            formatted_diff['chunks'].append({
+                'chunk_index': i,
+                'operations': format_chunk_diff(chunk_diff, old_chunk, new_chunk)
+            })
+
+    # Handle case where new content has more chunks
+    for i, new_chunk in enumerate(new_chunks[len(old_chunks):], start=len(old_chunks)):
+        formatted_diff['chunks'].append({
+            'chunk_index': i,
+            'operations': [{'operation': 'insert', 'content': new_chunk}]
+        })
+
+    return formatted_diff
+
+def format_chunk_diff(diff, old_chunk, new_chunk):
+    formatted_ops = []
+    for op, old_pos, new_pos in diff:
+        if op == 'equal':
+            formatted_ops.append({
+                'operation': 'equal',
+                'content': old_chunk[old_pos]
+            })
+        elif op == 'replace':
+            formatted_ops.append({
+                'operation': 'replace',
+                'old_content': old_chunk[old_pos],
+                'new_content': new_chunk[new_pos]
+            })
+        elif op == 'insert':
+            formatted_ops.append({
+                'operation': 'insert',
+                'content': new_chunk[new_pos]
+            })
+        elif op == 'delete':
+            formatted_ops.append({
+                'operation': 'delete',
+                'content': old_chunk[old_pos]
+            })
+    return formatted_ops
