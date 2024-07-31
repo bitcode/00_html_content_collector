@@ -11,6 +11,7 @@ def load_manifest():
     except FileNotFoundError:
         raise FileNotFoundError(f"core_manifest.json not found in {parent_dir}")
 
+
 MANIFEST = load_manifest()
 
 # Add any project-specific configurations here

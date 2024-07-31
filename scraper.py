@@ -7,81 +7,34 @@ import logging
 import hashlib
 import functools
 import mimetypes
-import random
+from scraper_core import normalize_url, clean_and_normalize_content, process_html_content, extract_metadata, create_connection, DynamicRateLimiter, setup_webdriver, extract_links_selenium, scrape_single_page, scroll_page, expand_content, get_last_scraped_url, start_scraping_from, load_checksum
 from functools import wraps, lru_cache
 from requests import Session
 from requests.exceptions import RequestException
-from proxy_config import get_proxy_url
 from collections import deque
 from datetime import datetime, timedelta
-from statistics import mean
-from urllib.parse import urlparse, urljoin, urlunparse, parse_qs, urlencode, urldefrag, unquote, quote, parse_qsl
+from urllib.parse import urlparse, urljoin, urlunparse, parse_qs, urlencode, parse_qsl
 
 # Third-party imports
-import idna
 import requests
 import difflib
 import xmltodict
 import cairosvg
-import extruct
-import bleach
 import html
-import sqlite3
+from utils import get_custom_headers
 from sqlite3 import Error
 from difflib import unified_diff
+from db_manager import get_page_update_frequency
 from bs4 import BeautifulSoup, Comment
-from dateutil import parser
-from w3lib.html import get_base_url
 from langdetect import detect
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.common.exceptions import ElementClickInterceptedException
-import concurrent.futures
-from multiprocessing import Manager
-from threading import Lock
 from queue import Queue
-
+from proxy_manager import ProxyManager
 # Local imports
 from config import MANIFEST, OUTPUT_DIR
-
-class DynamicRateLimiter:
-    def __init__(self, initial_delay=1, min_delay=0.5, max_delay=5, backoff_factor=1.5):
-        self.current_delay = initial_delay
-        self.min_delay = min_delay
-        self.max_delay = max_delay
-        self.backoff_factor = backoff_factor
-        self.response_times = []
-
-    def wait(self):
-        time.sleep(self.current_delay)
-
-    def update(self, response_time):
-        self.response_times.append(response_time)
-        if len(self.response_times) > 10:
-            self.response_times.pop(0)
-
-        avg_response_time = mean(self.response_times)
-
-        if avg_response_time > 1:  # If average response time is over 1 second
-            self.increase_delay()
-        elif avg_response_time < 0.5 and self.current_delay > self.min_delay:
-            self.decrease_delay()
-
-    def increase_delay(self):
-        self.current_delay = min(self.current_delay * self.backoff_factor, self.max_delay)
-
-    def decrease_delay(self):
-        self.current_delay = max(self.current_delay / self.backoff_factor, self.min_delay)
-
-    def backoff(self):
-        self.current_delay = min(self.current_delay * self.backoff_factor * 2, self.max_delay)
-
 
 class PriorityQueue(Queue):
     def put(self, item, *args, **kwargs):
@@ -197,48 +150,6 @@ class Scraper:
         raise Exception("Failed to fetch page after 3 attempts")
 
 
-class ProxyManager:
-    def __init__(self, max_failures=3, health_check_interval=300):
-        self.proxy_url = get_proxy_url()
-        self.max_failures = max_failures
-        self.health_check_interval = health_check_interval
-        self.failure_count = 0
-        self.last_health_check = 0
-        self.proxy = {
-            'http': self.proxy_url,
-            'https': self.proxy_url
-        }
-
-    def get_proxy(self):
-        current_time = time.time()
-        if current_time - self.last_health_check > self.health_check_interval:
-            self.check_proxy_health()
-        return self.proxy
-
-    def check_proxy_health(self):
-        try:
-            response = requests.get('https://httpbin.org/ip', proxies=self.proxy, timeout=10)
-            response.raise_for_status()
-            self.failure_count = 0
-            self.last_health_check = time.time()
-            print(f"Proxy health check passed. IP: {response.json()['origin']}")
-        except RequestException as e:
-            self.failure_count += 1
-            print(f"Proxy health check failed: {str(e)}")
-            if self.failure_count >= self.max_failures:
-                self.rotate_proxy()
-
-    def rotate_proxy(self):
-        # For Bright Data, rotation is automatic, so we just reset the failure count
-        self.failure_count = 0
-        print("Proxy rotated (Bright Data handles rotation automatically)")
-
-    def handle_request_error(self, error):
-        self.failure_count += 1
-        print(f"Proxy request failed: {str(error)}")
-        if self.failure_count >= self.max_failures:
-            self.rotate_proxy()
-
 def get_proxied_session():
     session = requests.Session()
     proxy_manager = ProxyManager()
@@ -256,28 +167,6 @@ def get_proxied_session():
 
     session.request = proxied_request
     return session
-
-
-def create_connection():
-    try:
-        conn = sqlite3.connect('scraper_data.db')
-        return conn
-    except Error as e:
-        print(f"Error connecting to database: {e}")
-        return None
-
-def setup_webdriver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")  # Run in headless mode (no GUI)
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-
-    proxy = ProxyManager().get_proxy()
-    chrome_options.add_argument(f'--proxy-server={proxy["https"]}')
-
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
 
 def normalize_html_structure(soup):
     # Ensure proper nesting and close unclosed tags
@@ -313,124 +202,6 @@ def normalize_urls(soup, base_url):
         a['href'] = urlunparse(parsed)
 
     return soup
-
-def normalize_url(url):
-    # Resolve protocol-relative URLs
-    if url.startswith('//'):
-        url = 'http:' + url
-
-    # Expand shortened URLs
-    url = expand_shortened_url(url)
-
-    # Remove fragment
-    url, _ = urldefrag(url)
-
-    # Parse the URL
-    parsed = urlparse(url)
-
-    # Normalize scheme and domain
-    scheme = parsed.scheme.lower()
-    netloc = parsed.netloc.lower()
-
-    # Handle Internationalized Domain Names (IDN)
-    try:
-        netloc = netloc.encode('idna').decode('ascii')
-    except idna.IDNAError:
-        logging.warning(f"Failed to encode IDN: {netloc}")
-
-    # WWW consistency
-    if netloc.startswith('www.'):
-        netloc = 'www.' + netloc.replace('www.', '')
-    elif netloc.startswith('www1.') or netloc.startswith('www2.'):
-        netloc = 'www.' + netloc[5:]
-
-    # Handle default port removal
-    if (scheme == 'http' and parsed.port == 80) or (scheme == 'https' and parsed.port == 443):
-        netloc = parsed.hostname
-
-    # Path normalization
-    path = parsed.path
-
-    # Resolve relative paths
-    segments = path.split('/')
-    resolved_segments = []
-    for segment in segments:
-        if segment == '.':
-            continue
-        elif segment == '..':
-            if resolved_segments:
-                resolved_segments.pop()
-        else:
-            resolved_segments.append(segment)
-    path = '/'.join(resolved_segments)
-
-    # Remove unnecessary slashes
-    path = re.sub(r'//+', '/', path)
-
-    # Trailing slash consistency
-    if path:
-        _, ext = os.path.splitext(path)
-        if not ext:
-            # It's a directory-like URL, add trailing slash if not present
-            path = path.rstrip('/') + '/'
-        else:
-            # It's a file-like URL, remove trailing slash if present
-            path = path.rstrip('/')
-    else:
-        # Empty path, add a single slash
-        path = '/'
-
-    # Decode unnecessary percent-encoded characters
-    path = unquote(path)
-
-    # Re-encode only the necessary characters
-    path = quote(path, safe='/:@&=+$,')
-
-    # Query parameter handling
-    query = parsed.query
-    if query:
-        # Parse and sort query parameters
-        query_params = parse_qsl(query)
-        # Remove empty parameters, sort, and remove session IDs
-        query_params = sorted((k, v) for k, v in query_params if v and not is_session_id(k))
-        # Reconstruct the query string
-        query = urlencode(query_params)
-
-    # Reconstruct the URL
-    normalized = urlunparse((
-        scheme,
-        netloc,
-        path,
-        parsed.params,
-        query,
-        ''  # Empty fragment
-    ))
-
-    return normalized
-
-def expand_shortened_url(url):
-    shortener_domains = ['bit.ly', 'tinyurl.com', 't.co', 'goo.gl']  # Add more as needed
-    parsed = urlparse(url)
-    if parsed.netloc in shortener_domains:
-        try:
-            response = requests.head(url, allow_redirects=True, timeout=5)
-            return response.url
-        except requests.RequestException:
-            logging.warning(f"Failed to expand shortened URL: {url}")
-    return url
-
-def is_session_id(param):
-    session_id_patterns = [
-        r'^(session|sid)$',
-        r'.*sessionid.*',
-        r'^(s|sess)$',
-        r'.*phpsessid.*',
-        r'.*jsessionid.*',
-        r'.*aspsessionid.*',
-        r'.*cfid.*',
-        r'.*cftoken.*',
-    ]
-    return any(re.match(pattern, param, re.IGNORECASE) for pattern in session_id_patterns)
 
 def basic_content_cleaning(soup):
     # Remove HTML comments
@@ -480,46 +251,12 @@ def retry_with_exponential_backoff(func, max_retries=5, initial_delay=1, max_del
             time.sleep(wait_time)
     return wrapper
 
-def extract_and_normalize_metadata(soup):
-    metadata = {}
-
-    # Extract and normalize dates
-    for meta in soup.find_all('meta'):
-        if 'name' in meta.attrs and 'content' in meta.attrs:
-            if meta['name'] in ['date', 'pubdate', 'lastmod', 'modified']:
-                try:
-                    metadata[meta['name']] = parser.parse(meta['content']).isoformat()
-                except ValueError:
-                    logging.warning(f"Unable to parse date: {meta['content']}")
-
-    # Normalize author names
-    authors = soup.find_all('meta', attrs={'name': 'author'})
-    if authors:
-        metadata['authors'] = [author['content'].strip() for author in authors]
-
-    return metadata
-
 def detect_language(text):
     try:
         return detect(text)
     except Exception:  # It's better to catch specific exceptions if possible
         logging.warning("Failed to detect language", exc_info=True)
         return None
-
-def clean_and_normalize_content(content, url):
-    soup = BeautifulSoup(content, 'html.parser')
-
-    soup = normalize_html_structure(soup)
-    soup = normalize_character_encoding(soup)
-    soup = normalize_urls(soup, url)
-    soup = basic_content_cleaning(soup)
-
-    normalized_text = normalize_whitespace(soup.get_text())
-
-    metadata = extract_and_normalize_metadata(soup)
-    metadata['language'] = detect_language(normalized_text)
-
-    return str(soup), metadata
 
 def is_acceptable_mime_type(mime_type):
     acceptable_types = [
@@ -551,62 +288,6 @@ def handle_metadata_errors(func):
 def extract_title(soup):
     return soup.title.string
 
-def extract_metadata(soup, url, html_content):
-    metadata = {
-        'url': url,
-        'extraction_date': datetime.now().isoformat(),
-        'title': extract_title(soup),
-        'description': None,
-        'keywords': None,
-        'last_modified': None,
-        'structured_data': None,  # New field for structured data
-    }
-
-    # Extract meta description
-    desc_tag = soup.find('meta', attrs={'name': 'description'})
-    if desc_tag:
-        metadata['description'] = desc_tag.get('content')
-
-    # Extract meta keywords
-    keywords_tag = soup.find('meta', attrs={'name': 'keywords'})
-    if keywords_tag:
-        metadata['keywords'] = keywords_tag.get('content')
-
-    # Extract last modified date
-    last_modified_tag = soup.find('meta', attrs={'name': 'last-modified'})
-    if last_modified_tag:
-        metadata['last_modified'] = last_modified_tag.get('content')
-
-    # Extract Open Graph metadata
-    og_tags = soup.find_all('meta', property=lambda x: x and x.startswith('og:'))
-    metadata['og'] = {tag.get('property')[3:]: tag.get('content') for tag in og_tags}
-
-    # Extract structured data
-    base_url = get_base_url(html_content, url)
-    structured_data = extruct.extract(
-        html_content,
-        base_url=base_url,
-        syntaxes=['json-ld', 'microdata', 'rdfa']
-    )
-
-    # Process and clean the structured data
-    cleaned_structured_data = {}
-    for key, value in structured_data.items():
-        if value:  # Only include non-empty data
-            cleaned_structured_data[key] = value
-
-    metadata['structured_data'] = cleaned_structured_data
-
-    # Extract and parse last modified date
-    last_modified_tag = soup.find('meta', attrs={'name': 'last-modified'})
-    if last_modified_tag:
-        try:
-            parsed_date = parser.parse(last_modified_tag.get('content'))
-            metadata['last_modified'] = parsed_date.isoformat()
-        except ValueError:
-            logging.warning(f"Unable to parse last modified date: {last_modified_tag.get('content')}")
-
-    return metadata
 
 class PriorityURL:
     def __init__(self, url, priority):
@@ -693,22 +374,6 @@ def is_valid_link(url, base_domain, start_path):
         return True
     logging.debug(f"Invalid link skipped: {normalized_url}")
     return False
-
-def extract_links(url, content, base_domain, start_path):
-    if not isinstance(content, str):
-        return set(), set()
-    soup = BeautifulSoup(content, 'html.parser')
-    links = set()
-    pagination_links = extract_pagination_links(soup, url)
-    for link in soup.find_all(['a', 'img', 'video', 'audio', 'source', 'iframe'], href=True, src=True):
-        href = link.get('href') or link.get('src')
-        full_url = urljoin(url, href)
-        normalized_url = normalize_url(full_url)
-        if is_valid_link(normalized_url, base_domain, start_path):
-            links.add(normalized_url)
-    logging.debug(f"Links extracted: {links}")
-    logging.debug(f"Pagination links extracted: {pagination_links}")
-    return links, pagination_links
 
 def extract_and_convert_svgs(soup, base_dir):
     """Extract SVG elements and convert them to PNG."""
@@ -850,25 +515,6 @@ def normalize_query_params(url):
          urlencode(query_params), parsed.fragment)
     )
 
-def process_html_content(soup, url, directory):
-    try:
-        preserve_latex(soup)
-        preserve_math_content(soup)
-        preserve_code_blocks(soup)
-        extract_and_convert_svgs(soup, directory)
-        extract_and_convert_iframe_svgs(soup, directory, url)
-    except Exception as e:
-        logging.error(f"Error processing HTML content for {url}: {str(e)}")
-
-def preserve_math_content(soup):
-    for math_element in soup.find_all(['script', 'span', 'div'], class_=['math-inline', 'math-block', 'MathJax', 'katex-inline', 'katex-block']):
-        math_element.string = preserve_mathjax(str(math_element))
-        math_element.string = preserve_katex(str(math_element))
-
-def preserve_code_blocks(soup):
-    for code_block in soup.find_all(['pre', 'code']):
-        code_block.string = bleach.clean(str(code_block), tags=['pre', 'code'], attributes={'class': []})
-
 def save_file_content(soup, filepath):
     try:
         with open(filepath, 'w', encoding='utf-8') as file:
@@ -913,72 +559,7 @@ def fetch_page(driver, url):
         logging.warning(f"WebDriver exception while fetching {url}: {str(e)}")
         raise
 
-def scroll_page(driver):
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    while True:
-        # Scroll down to bottom
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
 
-        # Wait to load page
-        time.sleep(2)
-
-        # Calculate new scroll height and compare with last scroll height
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
-
-        # Optional: implement a maximum scroll limit
-        if last_height > 50000:  # Example: stop after 50000 pixels
-            logging.info("Reached maximum scroll limit")
-            break
-
-def expand_content(driver):
-    # List of common class names or IDs for expandable content
-    expandable_selectors = [
-        ".show-more", ".read-more", ".expand", "[id*='expand']", "[class*='expand']",
-        "[aria-expanded='false']", ".collapsed", ".toggle", ".accordion-header"
-    ]
-
-    load_more_selectors = [
-        ".load-more", ".show-more", "#loadMoreButton",
-        "[data-action='load-more']", "[aria-label='Load more']"
-    ]
-
-    for selector in load_more_selectors:
-        while True:
-            try:
-                load_more_button = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                )
-                driver.execute_script("arguments[0].click();", load_more_button)
-                time.sleep(2)  # Wait for content to load
-            except TimeoutException:
-                # No more "Load More" buttons found
-                break
-            except ElementClickInterceptedException:
-                # Button might be obscured, try to scroll to it
-                driver.execute_script("arguments[0].scrollIntoView();", load_more_button)
-                time.sleep(1)
-                continue
-            except Exception as e:
-                logging.error(f"Error expanding 'Load More' content: {str(e)}")
-                break
-
-    for selector in expandable_selectors:
-        elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        for element in elements:
-            try:
-                if element.is_displayed() and element.is_enabled():
-                    driver.execute_script("arguments[0].click();", element)
-                    time.sleep(1)  # Wait for content to expand
-            except ElementClickInterceptedException:
-                logging.warning(f"Could not click element: {selector}")
-            except Exception as e:
-                logging.error(f"Error expanding content: {str(e)}")
-
-def calculate_checksum(content):
-    return hashlib.md5(content.encode()).hexdigest()
 
 def has_headers_changed(url, existing_headers):
     try:
@@ -1088,18 +669,6 @@ def scrape_page(base_url, doc_name, version, initial_delay=1):
     finally:
         driver.quit()
 
-def extract_links_selenium(driver, base_domain, start_path):
-    links = set()
-    pagination_links = set()
-    for a in driver.find_elements(By.TAG_NAME, 'a'):
-        href = a.get_attribute('href')
-        if href and is_valid_link(href, base_domain, start_path):
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            canonical_href = get_canonical_url(soup, href)
-            links.add(canonical_href)
-            if re.search(r'Next|Próximo|\d+', a.text):
-                pagination_links.add(canonical_href)
-    return links, pagination_links
 
 @retry_with_exponential_backoff
 def parse_sitemap(base_url):
@@ -1128,124 +697,6 @@ def parse_sitemap(base_url):
         logging.error(f"Error parsing sitemap XML from {sitemap_url}: {e}")
         return []
 
-def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visited, queue, driver, base_domain, start_path, link_integrity_results):
-    normalized_url = normalize_url(url)
-    if normalized_url not in visited and is_valid_link(normalized_url, base_domain, start_path):
-        try:
-            with rate_limiter.lock:
-                rate_limiter.wait()
-
-            start_time = time.time()
-
-            # Load the existing checksum and headers
-            existing_checksum = cached_load_checksum(normalized_url)
-            existing_headers = get_stored_headers(normalized_url)
-
-            if not has_headers_changed(url, existing_headers):
-                logging.info(f'Headers unchanged, skipping: {url}')
-                return
-
-            content_type = requests.head(url).headers.get('Content-Type', '').split(';')[0]
-
-            if content_type.startswith(('image/', 'audio/', 'video/', 'application/pdf')):
-                download_media_file(url, doc_name, version)
-                visited.add(url)
-            else:
-                @circuit_breaker
-                def fetch_with_circuit_breaker():
-                    return fetch_page(driver, url)
-
-                try:
-                    content = fetch_with_circuit_breaker()
-                except Exception as e:
-                    if isinstance(e, RetryExhaustedException):
-                        logging.error(f"Max retries reached for {url}: {str(e)}")
-                    elif str(e) == "Circuit is OPEN":
-                        logging.error(f"Circuit breaker is open. Skipping {url}")
-                    else:
-                        logging.error(f"Unexpected error while fetching {url}: {str(e)}")
-                    return
-
-                new_checksum = calculate_checksum(content)
-
-                if existing_checksum != new_checksum:
-                    soup = BeautifulSoup(content, 'html.parser')
-                    canonical_url = get_canonical_url(soup, url)
-
-                    if canonical_url != url:
-                        logging.info(f"Canonical URL found for {url}: {canonical_url}")
-                        if canonical_url in visited:
-                            logging.info(f"Canonical URL {canonical_url} already visited, skipping.")
-                            return
-                        url = canonical_url  # Use the canonical URL from this point on
-
-                    with hash_manager.lock:
-                        old_hash_info = hash_manager.get_hash_info(doc_name, version, url)
-                        if hash_manager.content_changed(doc_name, version, url, content):
-                            visited.add(url)
-                            logging.info(f'Content changed, updating: {url}')
-
-                            if old_hash_info:
-                                # Generate diff using the new function
-                                diff = generate_optimized_diff(old_hash_info['content'], content, doc_name, version)
-                                try:
-                                    update_partial_content(doc_name, version, url, diff)
-                                except Exception as e:
-                                    logging.error(f"Partial update failed for {url}: {str(e)}")
-                                    # Fallback to full content update
-                                    save_content(content, url, doc_name, version, content_type)
-                            else:
-                                # Full save for new content
-                                save_content(content, url, doc_name, version, content_type)
-
-                            # Save to database
-                            new_headers = {
-                                'Last-Modified': driver.execute_script("return document.lastModified;"),
-                                'ETag': driver.execute_script("return document.querySelector('meta[name=\"etag\"]')?.content;"),
-                                'Content-Length': len(content)
-                            }
-                            save_page(url, content, new_checksum, new_headers)
-
-                            # Extract links from rendered page
-                            links, pagination_links = extract_links_selenium(driver, base_domain, start_path)
-
-                            # Recalculate priorities for all links
-                            all_links = links.union(pagination_links)
-                            prioritized_links = prioritize_pages(all_links, hash_manager, doc_name, version)
-
-                            for priority, link in prioritized_links:
-                                if link not in visited:
-                                    if link in pagination_links:
-                                        priority *= 1.5  # Increase priority for pagination links
-                                    queue.put((priority, link))
-
-                            # Perform link integrity check for all links
-                            for link in all_links:
-                                integrity_result = check_link_integrity(link, url)
-                                link_integrity_results.append(integrity_result)
-                                save_link_integrity(integrity_result)
-                        else:
-                            logging.info(f'Content unchanged, skipping: {url}')
-
-                    # Update stored headers
-                    update_stored_headers(url, new_headers)
-                else:
-                    logging.info(f'Content unchanged, skipping: {url}')
-
-                # Save scrape progress
-                save_scrape_progress(url)
-
-            with rate_limiter.lock:
-                rate_limiter.update(time.time() - start_time)
-
-        except RequestException as e:
-            logging.error(f"Network error while scraping {url}: {str(e)}")
-            with rate_limiter.lock:
-                rate_limiter.backoff()
-        except Exception as e:
-            logging.error(f"Unexpected error while scraping {url}: {str(e)}")
-            with rate_limiter.lock:
-                rate_limiter.backoff()
 
 def worker(queue, doc_name, version, rate_limiter, hash_manager, visited, driver, base_domain, start_path, link_integrity_results):
     while True:
@@ -1302,27 +753,6 @@ def load_scrape_state(doc_name, version):
         return state
     return None
 
-def scrape_pages_concurrently(queue, doc_name, version, rate_limiter, hash_manager, visited, base_domain, start_path, link_integrity_results, max_workers=5):
-    def worker_wrapper():
-        driver = setup_webdriver()
-        worker(queue, doc_name, version, rate_limiter, hash_manager, visited, driver, base_domain, start_path, link_integrity_results)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(worker_wrapper) for _ in range(max_workers)]
-
-        while not queue.empty():
-            if time_to_save_state():
-                save_scrape_state(doc_name, version, queue, visited)
-
-            done, not_done = concurrent.futures.wait(futures, timeout=0, return_when=concurrent.futures.FIRST_COMPLETED)
-
-            for future in done:
-                futures.remove(future)
-                futures.append(executor.submit(worker_wrapper))
-
-        concurrent.futures.wait(futures)
-
-    process_link_integrity_results(link_integrity_results, doc_name, version)
 
 def check_link_integrity(url, base_url):
     try:
@@ -1483,44 +913,7 @@ def update_asset_references(soup, assets, doc_name, version):
 
     return soup
 
-def extract_pagination_links(soup, base_url):
-    pagination_links = set()
 
-    # Numbered pagination
-    numbered_links = soup.find_all('a', href=True, text=re.compile(r'^\d+$'))
-
-    # Next/Previous buttons
-    next_prev_links = soup.find_all('a', href=True, text=re.compile(r'Next|Previous|Próximo|Anterior', re.IGNORECASE))
-
-    # "Load More" buttons
-    load_more_links = soup.find_all('a', href=True, text=re.compile(r'Load More|Show More|Ver Mais', re.IGNORECASE))
-
-    # Combine all pagination links
-    for link in numbered_links + next_prev_links + load_more_links:
-        href = link['href']
-        full_url = urljoin(base_url, href)
-        pagination_links.add(full_url)
-
-    return pagination_links
-
-def get_custom_headers():
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0'
-    ]
-
-    headers = {
-        'User-Agent': random.choice(user_agents),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',  # Do Not Track Request Header
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    }
-    return headers
 
 def update_content(old_content, new_content):
     diff = list(unified_diff(old_content.splitlines(), new_content.splitlines()))
@@ -1530,68 +923,8 @@ def update_content(old_content, new_content):
         return new_content
     return old_content
 
-def init_db():
-    conn = create_connection()
-    if conn is not None:
-        try:
-            c = conn.cursor()
-            c.execute('''CREATE TABLE IF NOT EXISTS pages
-                         (url TEXT PRIMARY KEY, content TEXT, checksum TEXT, last_updated TIMESTAMP)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS scrape_progress
-                         (url TEXT PRIMARY KEY, last_scraped TIMESTAMP)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS link_integrity
-                         (url TEXT PRIMARY KEY, status_code INTEGER, is_redirect BOOLEAN, final_url TEXT,
-                          content_type TEXT, is_internal BOOLEAN, anchor_exists BOOLEAN)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS page_headers
-                         (url TEXT PRIMARY KEY, headers TEXT, last_updated TIMESTAMP)''')
-            conn.commit()
-        except Error as e:
-            print(f"Error creating database tables: {e}")
-        finally:
-            conn.close()
-    else:
-        print("Error! Cannot create the database connection.")
 
-def save_page(url, content, checksum, headers):
-    conn = create_connection()
-    if conn is not None:
-        try:
-            c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, datetime('now'))", (url, content, checksum))
-            headers_json = json.dumps(headers)
-            c.execute("INSERT OR REPLACE INTO page_headers VALUES (?, ?, datetime('now'))", (url, headers_json))
-            conn.commit()
-        except Error as e:
-            print(f"Error saving page and headers: {e}")
-        finally:
-            conn.close()
-    else:
-        print("Error! Cannot create the database connection.")
 
-def get_page_update_frequency(url):
-    conn = create_connection()
-    if conn is not None:
-        try:
-            c = conn.cursor()
-            c.execute("""
-                SELECT COUNT(*) as update_count,
-                       MIN(julianday('now') - julianday(last_updated)) as days_since_last_update
-                FROM pages
-                WHERE url = ? AND last_updated > datetime('now', '-30 days')
-            """, (url,))
-            result = c.fetchone()
-            if result:
-                update_count, days_since_last_update = result
-                if days_since_last_update is not None:
-                    return update_count / (days_since_last_update + 1)  # Adding 1 to avoid division by zero
-            return 0
-        except Error as e:
-            print(f"Error getting page update frequency: {e}")
-        finally:
-            conn.close()
-    else:
-        print("Error! Cannot create the database connection.")
-    return 0
 
 def prioritize_pages(urls, hash_manager, doc_name, version):
     prioritized_urls = []
@@ -1602,35 +935,7 @@ def prioritize_pages(urls, hash_manager, doc_name, version):
     # Sort by priority (highest first)
     return sorted(prioritized_urls, key=lambda x: x[0], reverse=True)
 
-def save_scrape_progress(url):
-    conn = create_connection()
-    if conn is not None:
-        try:
-            c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO scrape_progress VALUES (?, datetime('now'))", (url,))
-            conn.commit()
-        except Error as e:
-            print(f"Error saving scrape progress: {e}")
-        finally:
-            conn.close()
-    else:
-        print("Error! Cannot create the database connection.")
 
-def get_last_scraped_url():
-    conn = create_connection()
-    if conn is not None:
-        try:
-            c = conn.cursor()
-            c.execute("SELECT url FROM scrape_progress ORDER BY last_scraped DESC LIMIT 1")
-            result = c.fetchone()
-            return result[0] if result else None
-        except Error as e:
-            print(f"Error getting last scraped URL: {e}")
-        finally:
-            conn.close()
-    else:
-        print("Error! Cannot create the database connection.")
-    return None
 
 def resume_scrape(start_url):
     last_url = get_last_scraped_url()
@@ -1660,62 +965,7 @@ def save_link_integrity(result):
     else:
         print("Error! Cannot create the database connection.")
 
-def load_checksum(url):
-    conn = create_connection()
-    if conn is not None:
-        try:
-            c = conn.cursor()
-            c.execute("SELECT checksum FROM pages WHERE url = ?", (url,))
-            result = c.fetchone()
-            return result[0] if result else None
-        except Error as e:
-            print(f"Error loading checksum: {e}")
-        finally:
-            conn.close()
-    return None
 
-def start_scraping_from(url, doc_name, version, initial_delay=1, max_workers=5):
-    logging.info(f"Starting scrape from URL: {url}")
-    try:
-        parsed_url = urlparse(url)
-        base_domain = parsed_url.netloc
-        start_path = os.path.dirname(parsed_url.path)
-
-        manager = Manager()
-        visited = manager.Set()
-        queue = PriorityQueue()
-        link_integrity_results = manager.list()
-
-        rate_limiter = DynamicRateLimiter(initial_delay=initial_delay)
-        rate_limiter.lock = Lock()
-        hash_manager = VersionedContentHashManager(OUTPUT_DIR)
-        hash_manager.lock = Lock()
-
-        normalized_url = normalize_url(url)
-        try:
-            response = requests.get(normalized_url)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            canonical_url = get_canonical_url(soup, normalized_url)
-
-            # Extract initial links
-            initial_links, _ = extract_links_selenium(setup_webdriver(), base_domain, start_path)
-
-            # Prioritize initial links
-            prioritized_links = prioritize_pages(initial_links, hash_manager, doc_name, version)
-
-            # Add prioritized links to the queue
-            for priority, link in prioritized_links:
-                queue.put((priority, link))
-
-        except requests.RequestException as e:
-            logging.error(f"Error fetching start URL: {e}")
-            return
-
-        scrape_pages_concurrently(queue, doc_name, version, rate_limiter, hash_manager, visited, base_domain, start_path, link_integrity_results, max_workers)
-    except Exception as e:
-        logging.error(f"Unexpected error in start_scraping_from: {e}")
-        raise
 
 def test_start_scraping_from():
     test_cases = [
@@ -1745,146 +995,8 @@ def cached_load_checksum(url):
     checksum_cache[url] = (checksum, datetime.now())
     return checksum
 
-def myers_diff(old_content, new_content):
-    def shortest_edit_sequence(a, b):
-        n, m = len(a), len(b)
-        max_d = n + m
-        v = {1: 0}
-        trace = []
-
-        for d in range(max_d + 1):
-            for k in range(-d, d + 1, 2):
-                if k == -d or (k != d and v.get(k - 1, float('-inf')) < v.get(k + 1, float('-inf'))):
-                    x = v[k + 1]
-                else:
-                    x = v[k - 1] + 1
-                y = x - k
-                while x < n and y < m and a[x] == b[y]:
-                    x, y = x + 1, y + 1
-                v[k] = x
-                if x >= n and y >= m:
-                    return trace
-            trace.append(v.copy())
-        return trace
-
-    def backtrack(trace, a, b):
-        x, y = len(a), len(b)
-        path = []
-        for d, v in reversed(list(enumerate(trace))):
-            k = x - y
-            if k == -d or (k != d and v.get(k - 1, float('-inf')) < v.get(k + 1, float('-inf'))):
-                k = k + 1
-            prev_x, prev_y = v[k], v[k] - k
-            while x > prev_x and y > prev_y:
-                path.append(('equal', x - 1, y - 1))
-                x, y = x - 1, y - 1
-            if d > 0:
-                path.append(('replace' if x > prev_x else 'insert', prev_x, prev_y))
-            x, y = prev_x, prev_y
-        return list(reversed(path))
-
-    a, b = old_content.splitlines(), new_content.splitlines()
-    trace = shortest_edit_sequence(a, b)
-    return backtrack(trace, a, b)
-
-def generate_diff(old_content, new_content, doc_name, version):
-    diff = myers_diff(old_content, new_content)
-
-    # Create a custom diff format with metadata
-    formatted_diff = {
-        'metadata': {
-            'doc_name': doc_name,
-            'version': version,
-            'timestamp': datetime.now().isoformat(),
-            'old_content_hash': hashlib.md5(old_content.encode()).hexdigest(),
-            'new_content_hash': hashlib.md5(new_content.encode()).hexdigest(),
-        },
-        'operations': []
-    }
-
-    for op, old_pos, new_pos in diff:
-        if op == 'equal':
-            formatted_diff['operations'].append({
-                'operation': 'equal',
-                'content': old_content.splitlines()[old_pos]
-            })
-        elif op == 'replace':
-            formatted_diff['operations'].append({
-                'operation': 'replace',
-                'old_content': old_content.splitlines()[old_pos],
-                'new_content': new_content.splitlines()[new_pos]
-            })
-        elif op == 'insert':
-            formatted_diff['operations'].append({
-                'operation': 'insert',
-                'content': new_content.splitlines()[new_pos]
-            })
-        elif op == 'delete':
-            formatted_diff['operations'].append({
-                'operation': 'delete',
-                'content': old_content.splitlines()[old_pos]
-            })
-
-    return formatted_diff
 
 def chunk_content(content, chunk_size=1000):
     """Split content into chunks of specified size."""
     return [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
 
-def generate_optimized_diff(old_content, new_content, doc_name, version, chunk_size=1000):
-    old_chunks = chunk_content(old_content, chunk_size)
-    new_chunks = chunk_content(new_content, chunk_size)
-
-    formatted_diff = {
-        'metadata': {
-            'doc_name': doc_name,
-            'version': version,
-            'timestamp': datetime.now().isoformat(),
-            'old_content_hash': hashlib.md5(old_content.encode()).hexdigest(),
-            'new_content_hash': hashlib.md5(new_content.encode()).hexdigest(),
-        },
-        'chunks': []
-    }
-
-    for i, (old_chunk, new_chunk) in enumerate(zip(old_chunks, new_chunks)):
-        if old_chunk != new_chunk:
-            chunk_diff = myers_diff(old_chunk, new_chunk)
-            formatted_diff['chunks'].append({
-                'chunk_index': i,
-                'operations': format_chunk_diff(chunk_diff, old_chunk, new_chunk)
-            })
-
-    # Handle case where new content has more chunks
-    for i, new_chunk in enumerate(new_chunks[len(old_chunks):], start=len(old_chunks)):
-        formatted_diff['chunks'].append({
-            'chunk_index': i,
-            'operations': [{'operation': 'insert', 'content': new_chunk}]
-        })
-
-    return formatted_diff
-
-def format_chunk_diff(diff, old_chunk, new_chunk):
-    formatted_ops = []
-    for op, old_pos, new_pos in diff:
-        if op == 'equal':
-            formatted_ops.append({
-                'operation': 'equal',
-                'content': old_chunk[old_pos]
-            })
-        elif op == 'replace':
-            formatted_ops.append({
-                'operation': 'replace',
-                'old_content': old_chunk[old_pos],
-                'new_content': new_chunk[new_pos]
-            })
-        elif op == 'insert':
-            formatted_ops.append({
-                'operation': 'insert',
-                'content': new_chunk[new_pos]
-            })
-        elif op == 'delete':
-            formatted_ops.append({
-                'operation': 'delete',
-                'content': old_chunk[old_pos]
-            })
-    return formatted_ops

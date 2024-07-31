@@ -1,4 +1,3 @@
-# proxy_config.py
 from dotenv import load_dotenv
 import os
 
