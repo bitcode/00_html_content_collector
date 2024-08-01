@@ -4,3 +4,4 @@
 ignore_list.txt
 test_scraper.py
 app.log
+./test_output
