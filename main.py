@@ -1,3 +1,4 @@
+# ./00_html_content_collector/main.py
 from config import MANIFEST, PROJECT_NAME, OUTPUT_DIR
 import argparse
 from scraper import start_scraping_from

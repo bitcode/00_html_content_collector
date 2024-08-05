@@ -1,4 +1,4 @@
-# custom_exceptions.py
+# ./00_html_content_collector/custom_exceptions.py
 
 class ScraperError(Exception):
     """Base class for scraper exceptions."""

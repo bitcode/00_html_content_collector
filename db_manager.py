@@ -1,3 +1,4 @@
+# ./00_html_content_collector/db_manager.py
 import sqlite3
 import json
 from sqlite3 import Error

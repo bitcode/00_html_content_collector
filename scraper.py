@@ -1,19 +1,30 @@
+# ./00_html_content_collector/scraper.py
 # Standard library imports
 import os
 import re
 import json
 import time
-import logging
 import hashlib
 import functools
 import mimetypes
-from scraper_core import normalize_url, clean_and_normalize_content, process_html_content, extract_metadata, create_connection, DynamicRateLimiter, setup_webdriver, extract_links_selenium, scrape_single_page, scroll_page, expand_content, get_last_scraped_url, start_scraping_from, load_checksum
+from scraper_core import (
+    normalize_url, clean_and_normalize_content, process_html_content, extract_metadata,
+    create_connection, DynamicRateLimiter, setup_webdriver, extract_links_selenium,
+    scrape_single_page, scrol_page, expand_content, get_last_scraped_url,
+    start_scraping_from, load_checksum
+)
 from functools import wraps, lru_cache
 from requests import Session
 from requests.exceptions import RequestException
 from collections import deque
+from webdriver_manager import scroll_page
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qs, urlencode, parse_qsl
+from custom_exceptions import (
+    NetworkError, ParsingError, MetadataExtractionError, DatabaseError,
+    ContentChangedError, CircuitBreakerError, LanguageDetectionError,
+    DuplicateContentError, RateLimitError, ConfigurationError
+)
 
 # Third-party imports
 import requests
@@ -33,8 +44,13 @@ from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from queue import Queue
 from proxy_manager import ProxyManager
+
 # Local imports
 from config import MANIFEST, OUTPUT_DIR
+from logger import setup_logging, log_error, log_info, log_warning, log_debug
+
+# Initialize loggers
+loggers = setup_logging(output_dir='logs', doc_name='scraper', version='v1')
 
 class PriorityQueue(Queue):
     def put(self, item, *args, **kwargs):
@@ -230,16 +246,16 @@ def retry_with_exponential_backoff(func, max_retries=5, initial_delay=1, max_del
             try:
                 return func(*args, **kwargs)
             except RequestException as e:
-                logging.warning(f"Network error occurred: {str(e)}")
+                log_warning(loggers, f"Network error occurred: {str(e)}")
                 delay_factor = 2
             except TimeoutException as e:
-                logging.warning(f"Timeout error occurred: {str(e)}")
+                log_warning(loggers, f"Timeout error occurred: {str(e)}")
                 delay_factor = 1.5
             except WebDriverException as e:
-                logging.warning(f"WebDriver error occurred: {str(e)}")
+                log_warning(loggers, f"WebDriver error occurred: {str(e)}")
                 delay_factor = 3
             except Exception as e:
-                logging.error(f"Unexpected error occurred: {str(e)}")
+                log_error(loggers, f"Unexpected error occurred: {str(e)}")
                 raise
 
             retries += 1
@@ -247,15 +263,15 @@ def retry_with_exponential_backoff(func, max_retries=5, initial_delay=1, max_del
                 raise RetryExhaustedException(f"Max retries reached for {func.__name__}")
 
             wait_time = min(delay * (delay_factor ** retries), max_delay)
-            logging.warning(f"Retrying in {wait_time:.2f} seconds...")
+            log_warning(loggers, f"Retrying in {wait_time:.2f} seconds...")
             time.sleep(wait_time)
     return wrapper
 
 def detect_language(text):
     try:
         return detect(text)
-    except Exception:  # It's better to catch specific exceptions if possible
-        logging.warning("Failed to detect language", exc_info=True)
+    except Exception:
+        log_warning(loggers, "Failed to detect language", exc_info=True)
         return None
 
 def is_acceptable_mime_type(mime_type):
@@ -280,7 +296,7 @@ def handle_metadata_errors(func):
         try:
             return func(*args, **kwargs)
         except AttributeError as e:
-            logging.warning(f"Metadata extraction error: {str(e)}")
+            log_warning(loggers, f"Metadata extraction error: {str(e)}")
             return None
     return wrapper
 
@@ -368,11 +384,11 @@ def is_valid_link(url, base_domain, start_path):
        parsed_url.path.startswith(start_path):
         canonical_url = get_canonical_url_from_head(normalized_url)
         if canonical_url != normalized_url:
-            logging.debug(f"Using canonical URL: {canonical_url} instead of {normalized_url}")
+            log_debug(loggers, f"Using canonical URL: {canonical_url} instead of {normalized_url}")
             return is_valid_link(canonical_url, base_domain, start_path)
-        logging.debug(f"Valid link found: {normalized_url}")
+        log_debug(loggers, f"Valid link found: {normalized_url}")
         return True
-    logging.debug(f"Invalid link skipped: {normalized_url}")
+    log_debug(loggers, f"Invalid link skipped: {normalized_url}")
     return False
 
 def extract_and_convert_svgs(soup, base_dir):
@@ -388,7 +404,7 @@ def extract_and_convert_svgs(soup, base_dir):
         img_tag = soup.new_tag('img', src=f'diagram_{i}.png')
         svg.replace_with(img_tag)
         os.remove(svg_file)  # Clean up SVG file after conversion
-        logging.debug(f"Converted SVG to PNG: {svg_file} to {png_file}")
+        log_debug(loggers, f"Converted SVG to PNG: {svg_file} to {png_file}")
 
 
 def compute_content_diff(old_content, new_content):
@@ -414,7 +430,7 @@ def update_partial_content(doc_name, version, url, diff):
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write('\n'.join(new_content))
 
-    logging.info(f"Partial update applied to {url}")
+    log_info(loggers, f"Partial update applied to {url}")
 
 def apply_diff(old_content, diff):
     lines = old_content.splitlines()
@@ -444,7 +460,7 @@ def fetch_svg_from_iframe(url, base_dir, index):
     png_file = os.path.join(base_dir, f'diagram_{index}.png')
     cairosvg.svg2png(url=svg_file, write_to=png_file)
     os.remove(svg_file)  # Clean up SVG file after conversion
-    logging.debug(f"Converted iframe SVG to PNG: {svg_file} to {png_file}")
+    log_debug(loggers, f"Converted iframe SVG to PNG: {svg_file} to {png_file}")
 
     return png_file
 
@@ -458,9 +474,9 @@ def extract_and_convert_iframe_svgs(soup, base_dir, base_url):
             png_file = fetch_svg_from_iframe(full_svg_url, base_dir, index)
             img_tag = soup.new_tag('img', src=os.path.basename(png_file))
             iframe.replace_with(img_tag)
-            logging.debug(f"Replaced iframe with img tag: {img_tag}")
+            log_debug(loggers, f"Replaced iframe with img tag: {img_tag}")
         except Exception as e:
-            logging.error(f"Error processing iframe {src}: {e}")
+            log_error(loggers, f"Error processing iframe {src}: {e}")
 
 def get_version_path(doc_name, version):
     return os.path.join(OUTPUT_DIR, 'docs', doc_name, version)
@@ -519,9 +535,9 @@ def save_file_content(soup, filepath):
     try:
         with open(filepath, 'w', encoding='utf-8') as file:
             file.write(str(soup))
-        logging.info(f'Saved content to {filepath}')
+        log_info(loggers, f'Saved content to {filepath}')
     except Exception as e:
-        logging.error(f"Error saving content to {filepath}: {str(e)}")
+        log_error(loggers, f"Error saving content to {filepath}: {str(e)}")
 
 def save_metadata(soup, url, filename, directory, additional_metadata):
     try:
@@ -533,7 +549,7 @@ def save_metadata(soup, url, filename, directory, additional_metadata):
         with open(metadata_filepath, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.error(f"Error extracting or saving metadata for {url}: {str(e)}")
+        log_error(loggers, f"Error extracting or saving metadata for {url}: {str(e)}")
 
 @circuit_breaker
 @retry_with_exponential_backoff
@@ -553,10 +569,10 @@ def fetch_page(driver, url):
 
         return driver.page_source
     except TimeoutException:
-        logging.warning(f"Timeout while loading {url}")
+        log_warning(loggers, f"Timeout while loading {url}")
         raise
     except WebDriverException as e:
-        logging.warning(f"WebDriver exception while fetching {url}: {str(e)}")
+        log_warning(loggers, f"WebDriver exception while fetching {url}: {str(e)}")
         raise
 
 
@@ -586,7 +602,7 @@ def get_stored_headers(url):
                 return json.loads(result[0])
             return None
         except Error as e:
-            logging.error(f"Error retrieving stored headers: {e}")
+            log_error(loggers, f"Error retrieving stored headers: {e}")
         finally:
             conn.close()
     return None
@@ -600,7 +616,7 @@ def update_stored_headers(url, headers):
             c.execute("INSERT OR REPLACE INTO page_headers (url, headers) VALUES (?, ?)", (url, headers_json))
             conn.commit()
         except Error as e:
-            logging.error(f"Error updating stored headers: {e}")
+            log_error(loggers, f"Error updating stored headers: {e}")
         finally:
             conn.close()
 
@@ -634,11 +650,11 @@ def scrape_page(base_url, doc_name, version, initial_delay=1):
                         content = fetch_with_circuit_breaker()
                     except Exception as e:
                         if isinstance(e, RetryExhaustedException):
-                            logging.error(f"Max retries reached for {url}: {str(e)}")
+                            log_error(loggers, f"Max retries reached for {url}: {str(e)}")
                         elif str(e) == "Circuit is OPEN":
-                            logging.error(f"Circuit breaker is open. Skipping {url}")
+                            log_error(loggers, f"Circuit breaker is open. Skipping {url}")
                         else:
-                            logging.error(f"Unexpected error while fetching {url}: {str(e)}")
+                            log_error(loggers, f"Unexpected error while fetching {url}: {str(e)}")
                         continue
 
                     content_type = 'text/html'  # Assume HTML for rendered content
@@ -648,7 +664,7 @@ def scrape_page(base_url, doc_name, version, initial_delay=1):
 
                     if hash_manager.content_changed(doc_name, version, url, content):
                         visited.add(url)
-                        logging.info(f'Content changed, updating: {url}')
+                        log_info(loggers, f'Content changed, updating: {url}')
                         save_content(content, url, doc_name, version, content_type)
 
                         # Extract links from rendered page
@@ -657,13 +673,13 @@ def scrape_page(base_url, doc_name, version, initial_delay=1):
                             if link not in visited:
                                 queue.append(link)
                     else:
-                        logging.info(f'Content unchanged, skipping: {url}')
+                        log_info(loggers, f'Content unchanged, skipping: {url}')
 
                 except RequestException as e:
-                    logging.error(f"Network error while scraping {url}: {str(e)}")
+                    log_error(loggers, f"Network error while scraping {url}: {str(e)}")
                     rate_limiter.backoff()
                 except Exception as e:
-                    logging.error(f"Unexpected error while scraping {url}: {str(e)}")
+                    log_error(loggers, f"Unexpected error while scraping {url}: {str(e)}")
                     rate_limiter.backoff()
 
     finally:
@@ -691,10 +707,10 @@ def parse_sitemap(base_url):
 
         return urls
     except requests.RequestException as e:
-        logging.error(f"Error fetching sitemap from {sitemap_url}: {e}")
+        log_error(loggers, f"Error fetching sitemap from {sitemap_url}: {e}")
         return []
     except xmltodict.expat.ExpatError as e:
-        logging.error(f"Error parsing sitemap XML from {sitemap_url}: {e}")
+        log_error(loggers, f"Error parsing sitemap XML from {sitemap_url}: {e}")
         return []
 
 
@@ -706,7 +722,7 @@ def worker(queue, doc_name, version, rate_limiter, hash_manager, visited, driver
             soup = BeautifulSoup(requests.get(normalized_url).content, 'html.parser')
             canonical_url = get_canonical_url(soup, normalized_url)
             if canonical_url != normalized_url:
-                logging.info(f"Canonical URL found: {canonical_url} for {normalized_url}")
+                log_info(loggers, f"Canonical URL found: {canonical_url} for {normalized_url}")
                 normalized_url = canonical_url
             scrape_single_page(normalized_url, doc_name, version, rate_limiter, hash_manager, visited, queue, driver, base_domain, start_path, link_integrity_results)
         except queue.Empty:
@@ -723,7 +739,7 @@ def get_canonical_url_from_head(url):
                 if link.get('rel') == 'canonical':
                     return link.get('url')
     except requests.RequestException:
-        logging.warning(f"Error checking canonical URL for {url}")
+        log_warning(loggers, f"Error checking canonical URL for {url}")
     return url
 
 def save_scrape_state(doc_name, version, queue, visited):
@@ -734,6 +750,7 @@ def save_scrape_state(doc_name, version, queue, visited):
     state_file = os.path.join(OUTPUT_DIR, 'scrape_states', f'{doc_name}_{version}_state.json')
     with open(state_file, 'w') as f:
         json.dump(state, f)
+
 
 last_save_time = time.time()
 
@@ -807,8 +824,8 @@ def process_link_integrity_results(link_integrity_results, doc_name, version):
             'missing_anchors': missing_anchors
         }, f, indent=2)
 
-    logging.info(f"Link integrity report saved for {doc_name} version {version}")
-    logging.info(f"Total links: {len(results)}, Broken: {len(broken_links)}, Redirects: {len(redirects)}, Missing anchors: {len(missing_anchors)}")
+    log_info(loggers, f"Link integrity report saved for {doc_name} version {version}")
+    log_info(loggers, f"Total links: {len(results)}, Broken: {len(broken_links)}, Redirects: {len(redirects)}, Missing anchors: {len(missing_anchors)}")
 
 def get_canonical_url(soup, url):
     canonical_tag = soup.find('link', rel='canonical')
@@ -838,9 +855,9 @@ def download_media_file(url, doc_name, version):
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-        logging.info(f"Downloaded media file: {url} to {file_path}")
+        log_info(loggers, f"Downloaded media file: {url} to {file_path}")
     except Exception as e:
-        logging.error(f"Error downloading media file {url}: {str(e)}")
+        log_error(loggers, f"Error downloading media file {url}: {str(e)}")
 
 def extract_asset_links(soup, base_url):
     assets = {
@@ -884,9 +901,9 @@ def download_asset(url, save_path):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, 'wb') as f:
             f.write(response.content)
-        logging.info(f"Downloaded asset: {url} to {save_path}")
+        log_info(loggers, f"Downloaded asset: {url} to {save_path}")
     except Exception as e:
-        logging.error(f"Error downloading asset {url}: {str(e)}")
+        log_error(loggers, f"Error downloading asset {url}: {str(e)}")
 
 def download_assets(assets, doc_name, version):
     base_path = get_version_path(doc_name, version)
@@ -966,23 +983,6 @@ def save_link_integrity(result):
         print("Error! Cannot create the database connection.")
 
 
-
-def test_start_scraping_from():
-    test_cases = [
-        ("https://example.com", "Example", "1.0"),
-        ("https://example.com/docs/", "Example", "2.0"),
-        ("https://example.com/blog/article1", "ExampleBlog", "1.0"),
-        ("https://subdomain.example.com", "SubExample", "1.0"),
-    ]
-
-    for url, doc_name, version in test_cases:
-        print(f"Testing start_scraping_from with URL: {url}")
-        start_scraping_from(url, doc_name, version)
-        print("Test completed.")
-
-if __name__ == "__main__":
-    test_start_scraping_from()
-
 checksum_cache = {}
 
 @lru_cache(maxsize=1000)
@@ -998,5 +998,4 @@ def cached_load_checksum(url):
 
 def chunk_content(content, chunk_size=1000):
     """Split content into chunks of specified size."""
-    return [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
-
+    return [content[i:i + chunk_size] for i in range(0, len(content), chunk_size)]

@@ -1,3 +1,4 @@
+# ./00_html_content_collector/scraper_core.py
 from scraper import normalize_url, is_valid_link, cached_load_checksum, get_stored_headers, has_headers_changed, download_media_file, calculate_checksum, get_canonical_url, save_content, prioritize_pages, check_link_integrity, extract_links_selenium, save_page, update_partial_content, circuit_breaker, fetch_page, generate_optimized_diff, save_scrape_progress, setup_webdriver, save_link_integrity, time_to_save_state, process_link_integrity_results, worker, save_scrape_state, update_stored_headers, urlparse, VersionedContentHashManager, RetryExhaustedException
 import os
 import time
@@ -10,9 +11,13 @@ from bs4 import BeautifulSoup
 from config import OUTPUT_DIR
 import PriorityQueue
 from rate_limiter import DynamicRateLimiter
-from logger import log_error, log_info
+from logger import setup_logging, log_error, log_info, log_warning, log_debug
+from custom_exceptions import NetworkError, ParsingError, DatabaseError, ContentChangedError, CircuitBreakerError
 
-def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visited, queue, driver, base_domain, start_path, link_integrity_results, loggers):
+# Initialize loggers
+loggers = setup_logging(output_dir='logs', doc_name='scraper_core', version='v1')
+
+def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visited, queue, driver, base_domain, start_path, link_integrity_results):
     normalized_url = normalize_url(url)
     if normalized_url not in visited and is_valid_link(normalized_url, base_domain, start_path):
         try:
@@ -29,7 +34,10 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
                 log_info(loggers, f'Headers unchanged, skipping: {url}')
                 return
 
-            content_type = requests.head(url).headers.get('Content-Type', '').split(';')[0]
+            try:
+                content_type = requests.head(url).headers.get('Content-Type', '').split(';')[0]
+            except RequestException as e:
+                raise NetworkError(f"Failed to fetch headers for {url}: {str(e)}", url=url)
 
             if content_type.startswith(('image/', 'audio/', 'video/', 'application/pdf')):
                 download_media_file(url, doc_name, version)
@@ -41,14 +49,12 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
 
                 try:
                     content = fetch_with_circuit_breaker()
+                except RetryExhaustedException as e:
+                    raise NetworkError(f"Max retries reached for {url}: {str(e)}", url=url)
+                except CircuitBreakerError as e:
+                    raise NetworkError(f"Circuit breaker is open. Skipping {url}: {str(e)}", url=url)
                 except Exception as e:
-                    if isinstance(e, RetryExhaustedException):
-                        log_error(loggers, f"Max retries reached for {url}: {str(e)}")
-                    elif str(e) == "Circuit is OPEN":
-                        log_error(loggers, f"Circuit breaker is open. Skipping {url}")
-                    else:
-                        log_error(loggers, f"Unexpected error while fetching {url}: {str(e)}")
-                    return
+                    raise NetworkError(f"Unexpected error while fetching {url}: {str(e)}", url=url)
 
                 new_checksum = calculate_checksum(content)
 
@@ -88,7 +94,10 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
                                 'ETag': driver.execute_script("return document.querySelector('meta[name=\"etag\"]')?.content;"),
                                 'Content-Length': len(content)
                             }
-                            save_page(url, content, new_checksum, new_headers)
+                            try:
+                                save_page(url, content, new_checksum, new_headers)
+                            except Exception as e:
+                                raise DatabaseError(f"Failed to save page {url}: {str(e)}", url=url)
 
                             # Extract links from rendered page
                             links, pagination_links = extract_links_selenium(driver, base_domain, start_path)
@@ -122,16 +131,22 @@ def scrape_single_page(url, doc_name, version, rate_limiter, hash_manager, visit
             with rate_limiter.lock:
                 rate_limiter.update(time.time() - start_time)
 
-        except RequestException as e:
-            log_error(loggers, f"Network error while scraping {url}: {str(e)}")
+        except NetworkError as e:
+            log_error(loggers, f"Network error while scraping {url}: {e.log_message()}")
             with rate_limiter.lock:
                 rate_limiter.backoff()
+        except ParsingError as e:
+            log_error(loggers, f"Parsing error while scraping {url}: {e.log_message()}")
+        except DatabaseError as e:
+            log_error(loggers, f"Database error while scraping {url}: {e.log_message()}")
+        except ContentChangedError as e:
+            log_warning(loggers, f"Content changed unexpectedly for {url}: {e.log_message()}")
         except Exception as e:
             log_error(loggers, f"Unexpected error while scraping {url}: {str(e)}")
             with rate_limiter.lock:
                 rate_limiter.backoff()
 
-def scrape_pages_concurrently(queue, doc_name, version, rate_limiter, hash_manager, visited, base_domain, start_path, link_integrity_results, loggers, max_workers=5):
+def scrape_pages_concurrently(queue, doc_name, version, rate_limiter, hash_manager, visited, base_domain, start_path, link_integrity_results, max_workers=5):
     def worker_wrapper():
         driver = setup_webdriver()
         worker(queue, doc_name, version, rate_limiter, hash_manager, visited, driver, base_domain, start_path, link_integrity_results, loggers)
@@ -153,7 +168,7 @@ def scrape_pages_concurrently(queue, doc_name, version, rate_limiter, hash_manag
 
     process_link_integrity_results(link_integrity_results, doc_name, version)
 
-def start_scraping_from(url, doc_name, version, initial_delay=1, max_workers=5, loggers=None):
+def start_scraping_from(url, doc_name, version, initial_delay=1, max_workers=5):
     log_info(loggers, f"Starting scrape from URL: {url}")
     try:
         parsed_url = urlparse(url)
@@ -187,11 +202,12 @@ def start_scraping_from(url, doc_name, version, initial_delay=1, max_workers=5, 
             for priority, link in prioritized_links:
                 queue.put((priority, link))
 
-        except requests.RequestException as e:
-            log_error(loggers, f"Error fetching start URL: {e}")
-            return
+        except RequestException as e:
+            raise NetworkError(f"Error fetching start URL: {str(e)}", url=url)
 
-        scrape_pages_concurrently(queue, doc_name, version, rate_limiter, hash_manager, visited, base_domain, start_path, link_integrity_results, loggers, max_workers)
+        scrape_pages_concurrently(queue, doc_name, version, rate_limiter, hash_manager, visited, base_domain, start_path, link_integrity_results, max_workers)
+    except NetworkError as e:
+        log_error(loggers, f"Network error in start_scraping_from: {e.log_message()}")
     except Exception as e:
-        log_error(loggers, f"Unexpected error in start_scraping_from: {e}")
+        log_error(loggers, f"Unexpected error in start_scraping_from: {str(e)}")
         raise
